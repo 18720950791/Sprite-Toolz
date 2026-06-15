@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 import sys
 import os
+import shutil
+import tempfile
+import threading
 import numpy as np
 from PIL import Image
 import imageio
@@ -8,9 +11,9 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QLabel, QScrollArea,
                             QVBoxLayout, QHBoxLayout, QWidget, QPushButton, 
                             QFileDialog, QSpinBox, QCheckBox, QColorDialog, 
                             QGridLayout, QGroupBox, QSlider, QFrame, QSizePolicy,
-                            QMessageBox, QTabWidget, QRadioButton)
+                            QMessageBox, QTabWidget, QRadioButton, QProgressBar)
 from PyQt6.QtGui import QPixmap, QPainter, QPen, QColor, QImage, QCursor
-from PyQt6.QtCore import Qt, QRect, QSize, QPoint
+from PyQt6.QtCore import Qt, QRect, QSize, QPoint, QThread, QObject, pyqtSignal
 
 
 class SpriteCanvas(QLabel):
