@@ -9,8 +9,51 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QLabel, QScrollArea,
                             QFileDialog, QSpinBox, QCheckBox, QColorDialog, 
                             QGridLayout, QGroupBox, QSlider, QFrame, QSizePolicy,
                             QMessageBox, QTabWidget, QRadioButton)
-from PyQt6.QtGui import QPixmap, QPainter, QPen, QColor, QImage, QCursor
+from PyQt6.QtGui import QPixmap, QPainter, QPen, QColor, QImage, QCursor, QKeySequence
 from PyQt6.QtCore import Qt, QRect, QSize, QPoint
+
+
+class HistoryManager:
+    """Manages undo/redo history with a bounded stack."""
+
+    def __init__(self, max_size=50):
+        self.undo_stack = []
+        self.redo_stack = []
+        self.max_size = max_size
+
+    def save_state(self, state):
+        """Push a state snapshot onto the undo stack."""
+        self.undo_stack.append(state)
+        if len(self.undo_stack) > self.max_size:
+            self.undo_stack.pop(0)
+        self.redo_stack.clear()
+
+    def undo(self, current_state):
+        """Undo: push current_state to redo, pop and return previous state."""
+        if not self.undo_stack:
+            return None
+        self.redo_stack.append(current_state)
+        return self.undo_stack.pop()
+
+    def redo(self, current_state):
+        """Redo: push current_state to undo, pop and return next state."""
+        if not self.redo_stack:
+            return None
+        self.undo_stack.append(current_state)
+        return self.redo_stack.pop()
+
+    def clear(self):
+        """Clear all history."""
+        self.undo_stack.clear()
+        self.redo_stack.clear()
+
+    @property
+    def can_undo(self):
+        return len(self.undo_stack) > 0
+
+    @property
+    def can_redo(self):
+        return len(self.redo_stack) > 0
 
 
 class SpriteCanvas(QLabel):
@@ -49,13 +92,45 @@ class SpriteCanvas(QLabel):
         # Add custom frame selection variables
         self.custom_frame_selection = []  # List to store frames in selection order
         self.is_custom_selecting = False  # Flag for custom selection mode
-        
+
     def load_spritesheet(self, filename):
         self.sprite_image = Image.open(filename)
         self.original_image = self.sprite_image.copy()  # Store original image
         self.spritesheet = np.array(self.sprite_image)
         self.update_pixmap()
-        
+
+    def get_state(self):
+        """Return a snapshot of the current canvas state."""
+        return {
+            'sprite_image': self.sprite_image.copy() if self.sprite_image else None,
+            'original_image': self.original_image.copy() if self.original_image else None,
+            'cell_width': self.cell_width,
+            'cell_height': self.cell_height,
+            'padding_preview': self.padding_preview,
+            'selected_cells': list(self.selected_cells),
+            'selected_row': self.selected_row,
+            'selected_column': self.selected_column,
+            'is_custom_selecting': self.is_custom_selecting,
+            'custom_frame_selection': list(self.custom_frame_selection),
+        }
+
+    def restore_state(self, state):
+        """Restore canvas to a previously saved state."""
+        self.sprite_image = state['sprite_image'].copy() if state['sprite_image'] else None
+        self.original_image = state['original_image'].copy() if state['original_image'] else None
+        self.cell_width = state['cell_width']
+        self.cell_height = state['cell_height']
+        self.padding_preview = state['padding_preview']
+        self.selected_cells = list(state['selected_cells'])
+        self.selected_row = state['selected_row']
+        self.selected_column = state['selected_column']
+        self.is_custom_selecting = state['is_custom_selecting']
+        self.custom_frame_selection = list(state['custom_frame_selection'])
+        if self.sprite_image is not None:
+            self.spritesheet = np.array(self.sprite_image)
+        self.update_pixmap()
+
+
     def update_pixmap(self):
         if self.sprite_image is None:
             return
@@ -782,8 +857,9 @@ class SpriteCanvas(QLabel):
 class SpriteToolz(QMainWindow):
     def __init__(self):
         super().__init__()
+        self.history = HistoryManager()
         self.initUI()
-        
+
     def initUI(self):
         # Set window properties
         self.setWindowTitle("Sprite Toolz")
@@ -978,6 +1054,25 @@ class SpriteToolz(QMainWindow):
         # Selection info
         self.selection_label = QLabel("No selection")
         manip_layout.addWidget(self.selection_label)
+
+        # Undo/Redo group
+        history_group = QGroupBox("History")
+        history_layout = QHBoxLayout()
+
+        self.undo_button = QPushButton("Undo (Ctrl+Z)")
+        self.undo_button.clicked.connect(self.undo)
+        self.undo_button.setEnabled(False)
+        self.undo_button.setShortcut(QKeySequence("Ctrl+Z"))
+        history_layout.addWidget(self.undo_button)
+
+        self.redo_button = QPushButton("Redo (Ctrl+Y)")
+        self.redo_button.clicked.connect(self.redo)
+        self.redo_button.setEnabled(False)
+        self.redo_button.setShortcut(QKeySequence("Ctrl+Y"))
+        history_layout.addWidget(self.redo_button)
+
+        history_group.setLayout(history_layout)
+        manip_layout.addWidget(history_group)
         
         # Row operations
         row_ops_group = QGroupBox("Row Operations")
@@ -1166,6 +1261,8 @@ class SpriteToolz(QMainWindow):
         
         if filename:
             self.sprite_canvas.load_spritesheet(filename)
+            self.history.clear()
+            self.update_undo_redo_buttons()
             self.export_button.setEnabled(True)
             # Enable zoom buttons
             self.zoom_in_button.setEnabled(True)
@@ -1338,10 +1435,12 @@ class SpriteToolz(QMainWindow):
     def apply_padding(self):
         padding = self.padding_spin.value()
         if padding > 0:
+            self.history.save_state(self.sprite_canvas.get_state())
             self.sprite_canvas.apply_padding()
             self.cell_width_spin.setValue(self.sprite_canvas.cell_width)
             self.cell_height_spin.setValue(self.sprite_canvas.cell_height)
             self.padding_spin.setValue(0)
+            self.update_undo_redo_buttons()
             self.statusBar().showMessage(f"Applied padding: {padding} pixels")
         else:
             self.statusBar().showMessage("No padding to apply")
@@ -1358,6 +1457,8 @@ class SpriteToolz(QMainWindow):
     
     def duplicate_row(self):
         """Duplicate the selected row"""
+        self.history.save_state(self.sprite_canvas.get_state())
+        self.update_undo_redo_buttons()
         if not self.sprite_canvas.sprite_image or not self.sprite_canvas.selection_start:
             return
             
@@ -1383,6 +1484,8 @@ class SpriteToolz(QMainWindow):
 
     def delete_row(self):
         """Delete the selected row"""
+        self.history.save_state(self.sprite_canvas.get_state())
+        self.update_undo_redo_buttons()
         if not self.sprite_canvas.sprite_image or not self.sprite_canvas.selection_start:
             return
             
@@ -1408,6 +1511,8 @@ class SpriteToolz(QMainWindow):
 
     def add_row_before(self):
         """Add a blank row before the selected row"""
+        self.history.save_state(self.sprite_canvas.get_state())
+        self.update_undo_redo_buttons()
         if not self.sprite_canvas.sprite_image or not self.sprite_canvas.selection_start:
             return
             
@@ -1432,6 +1537,8 @@ class SpriteToolz(QMainWindow):
 
     def add_row_after(self):
         """Add a blank row after the selected row"""
+        self.history.save_state(self.sprite_canvas.get_state())
+        self.update_undo_redo_buttons()
         if not self.sprite_canvas.sprite_image or not self.sprite_canvas.selection_start:
             return
             
@@ -1475,6 +1582,8 @@ class SpriteToolz(QMainWindow):
 
     def duplicate_column(self):
         """Duplicate the selected column"""
+        self.history.save_state(self.sprite_canvas.get_state())
+        self.update_undo_redo_buttons()
         if not self.sprite_canvas.sprite_image or not self.sprite_canvas.selection_start:
             return
             
@@ -1500,6 +1609,8 @@ class SpriteToolz(QMainWindow):
 
     def delete_column(self):
         """Delete the selected column"""
+        self.history.save_state(self.sprite_canvas.get_state())
+        self.update_undo_redo_buttons()
         if not self.sprite_canvas.sprite_image or not self.sprite_canvas.selection_start:
             return
             
@@ -1526,6 +1637,8 @@ class SpriteToolz(QMainWindow):
 
     def add_column_before(self):
         """Add a blank column before the selected column"""
+        self.history.save_state(self.sprite_canvas.get_state())
+        self.update_undo_redo_buttons()
         if not self.sprite_canvas.sprite_image or not self.sprite_canvas.selection_start:
             return
             
@@ -1550,6 +1663,8 @@ class SpriteToolz(QMainWindow):
 
     def add_column_after(self):
         """Add a blank column after the selected column"""
+        self.history.save_state(self.sprite_canvas.get_state())
+        self.update_undo_redo_buttons()
         if not self.sprite_canvas.sprite_image or not self.sprite_canvas.selection_start:
             return
             
@@ -1593,6 +1708,8 @@ class SpriteToolz(QMainWindow):
 
     def duplicate_frame(self):
         """Duplicate the selected frame"""
+        self.history.save_state(self.sprite_canvas.get_state())
+        self.update_undo_redo_buttons()
         if not self.sprite_canvas.sprite_image or not self.sprite_canvas.selection_start:
             return
             
@@ -1622,6 +1739,8 @@ class SpriteToolz(QMainWindow):
 
     def delete_frame(self):
         """Delete the selected frame"""
+        self.history.save_state(self.sprite_canvas.get_state())
+        self.update_undo_redo_buttons()
         if not self.sprite_canvas.sprite_image or not self.sprite_canvas.selection_start:
             return
             
@@ -1727,6 +1846,77 @@ class SpriteToolz(QMainWindow):
             self.selection_label.setText(f"Selected column: {start_col}")
         else:
             self.selection_label.setText(f"Selected area: ({start_col}, {start_row}) to ({end_col}, {end_row})")
+
+    def undo(self):
+        """Undo the last mutation operation."""
+        state = self.history.undo(self.sprite_canvas.get_state())
+        if state is not None:
+            self.sprite_canvas.restore_state(state)
+            # Sync cell size spinboxes
+            self.cell_width_spin.blockSignals(True)
+            self.cell_height_spin.blockSignals(True)
+            self.cell_width_spin.setValue(self.sprite_canvas.cell_width)
+            self.cell_height_spin.setValue(self.sprite_canvas.cell_height)
+            self.cell_width_spin.blockSignals(False)
+            self.cell_height_spin.blockSignals(False)
+            # Sync row/column count spinboxes
+            if self.sprite_canvas.sprite_image:
+                cols = self.sprite_canvas.sprite_image.size[0] // self.sprite_canvas.cell_width
+                rows = self.sprite_canvas.sprite_image.size[1] // self.sprite_canvas.cell_height
+                self.row_count_spin.blockSignals(True)
+                self.col_count_spin.blockSignals(True)
+                self.row_count_spin.setValue(rows)
+                self.col_count_spin.setValue(cols)
+                self.row_count_spin.blockSignals(False)
+                self.col_count_spin.blockSignals(False)
+            # Sync padding preview spinbox
+            self.padding_spin.blockSignals(True)
+            self.padding_spin.setValue(self.sprite_canvas.padding_preview)
+            self.padding_spin.blockSignals(False)
+            self.update_undo_redo_buttons()
+            self.update_selection_label()
+            self.update_button_states()
+            self.statusBar().showMessage("Undo")
+        else:
+            self.statusBar().showMessage("Nothing to undo")
+
+    def redo(self):
+        """Redo the last undone operation."""
+        state = self.history.redo(self.sprite_canvas.get_state())
+        if state is not None:
+            self.sprite_canvas.restore_state(state)
+            # Sync cell size spinboxes
+            self.cell_width_spin.blockSignals(True)
+            self.cell_height_spin.blockSignals(True)
+            self.cell_width_spin.setValue(self.sprite_canvas.cell_width)
+            self.cell_height_spin.setValue(self.sprite_canvas.cell_height)
+            self.cell_width_spin.blockSignals(False)
+            self.cell_height_spin.blockSignals(False)
+            # Sync row/column count spinboxes
+            if self.sprite_canvas.sprite_image:
+                cols = self.sprite_canvas.sprite_image.size[0] // self.sprite_canvas.cell_width
+                rows = self.sprite_canvas.sprite_image.size[1] // self.sprite_canvas.cell_height
+                self.row_count_spin.blockSignals(True)
+                self.col_count_spin.blockSignals(True)
+                self.row_count_spin.setValue(rows)
+                self.col_count_spin.setValue(cols)
+                self.row_count_spin.blockSignals(False)
+                self.col_count_spin.blockSignals(False)
+            # Sync padding preview spinbox
+            self.padding_spin.blockSignals(True)
+            self.padding_spin.setValue(self.sprite_canvas.padding_preview)
+            self.padding_spin.blockSignals(False)
+            self.update_undo_redo_buttons()
+            self.update_selection_label()
+            self.update_button_states()
+            self.statusBar().showMessage("Redo")
+        else:
+            self.statusBar().showMessage("Nothing to redo")
+
+    def update_undo_redo_buttons(self):
+        """Update enabled state of undo/redo buttons based on history."""
+        self.undo_button.setEnabled(self.history.can_undo)
+        self.redo_button.setEnabled(self.history.can_redo)
 
     def select_input_folder(self):
         """Open folder selection dialog for batch processing"""
