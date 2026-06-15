@@ -2,15 +2,17 @@
 import sys
 import os
 import numpy as np
+import threading
 from PIL import Image
 import imageio
-from PyQt6.QtWidgets import (QApplication, QMainWindow, QLabel, QScrollArea, 
-                            QVBoxLayout, QHBoxLayout, QWidget, QPushButton, 
-                            QFileDialog, QSpinBox, QCheckBox, QColorDialog, 
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QLabel, QScrollArea,
+                            QVBoxLayout, QHBoxLayout, QWidget, QPushButton,
+                            QFileDialog, QSpinBox, QCheckBox, QColorDialog,
                             QGridLayout, QGroupBox, QSlider, QFrame, QSizePolicy,
-                            QMessageBox, QTabWidget, QRadioButton)
+                            QMessageBox, QTabWidget, QRadioButton, QProgressBar,
+                            QTextEdit, QDialog, QDialogButtonBox)
 from PyQt6.QtGui import QPixmap, QPainter, QPen, QColor, QImage, QCursor
-from PyQt6.QtCore import Qt, QRect, QSize, QPoint
+from PyQt6.QtCore import Qt, QRect, QSize, QPoint, QThread, pyqtSignal
 
 
 class SpriteCanvas(QLabel):
@@ -779,10 +781,272 @@ class SpriteCanvas(QLabel):
         return False
 
 
+class BatchWorker(QThread):
+    """Background worker for batch sprite processing."""
+
+    progress = pyqtSignal(int, int, str)       # (current_file_index, total_files, filename)
+    file_done = pyqtSignal(str, str)            # (filename, status: 'success'|'skipped'|'failed')
+    finished = pyqtSignal(list, list, list)     # (succeeded, skipped, failed)
+
+    def __init__(self, input_folder, cell_width, cell_height, padding,
+                 export_frames, export_rows, export_gif, export_apng,
+                 include_subfolders):
+        super().__init__()
+        self.input_folder = input_folder
+        self.cell_width = cell_width
+        self.cell_height = cell_height
+        self.padding = padding
+        self.export_frames = export_frames
+        self.export_rows = export_rows
+        self.export_gif = export_gif
+        self.export_apng = export_apng
+        self.include_subfolders = include_subfolders
+        self._cancelled = False
+        self._lock = threading.Lock()
+
+    def cancel(self):
+        """Request cancellation. Current file finishes atomically, then stops."""
+        self._cancelled = True
+
+    def run(self):
+        try:
+            self._run_inner()
+        except Exception as e:
+            self.finished.emit([], [], [f"Worker crash: {e}"])
+
+    def _run_inner(self):
+        succeeded = []
+        skipped = []
+        failed = []
+
+        # Validate that at least one export option is selected
+        if not any([self.export_frames, self.export_rows,
+                    self.export_gif, self.export_apng]):
+            self.finished.emit([], ["No export options selected"], [])
+            return
+
+        output_folder = os.path.join(self.input_folder, "processed")
+        os.makedirs(output_folder, exist_ok=True)
+
+        # Collect files
+        if self.include_subfolders:
+            sprite_files = []
+            for root, _, files in os.walk(self.input_folder):
+                for file in files:
+                    if file.lower().endswith(('.png', '.jpg', '.bmp', '.gif')):
+                        sprite_files.append(os.path.join(root, file))
+        else:
+            sprite_files = [
+                os.path.join(self.input_folder, f)
+                for f in os.listdir(self.input_folder)
+                if f.lower().endswith(('.png', '.jpg', '.bmp', '.gif'))
+            ]
+
+        if not sprite_files:
+            self.finished.emit([], ["No sprite sheets found"], [])
+            return
+
+        total = len(sprite_files)
+
+        for i, file_path in enumerate(sprite_files, 1):
+            if self._cancelled:
+                remaining = [os.path.basename(fp) for fp in sprite_files[i - 1:]]
+                skipped.extend([f"{name} (cancelled)" for name in remaining])
+                break
+
+            filename = os.path.basename(file_path)
+            self.progress.emit(i, total, filename)
+
+            created_files = []
+            try:
+                self._process_file(file_path, output_folder, created_files)
+                succeeded.append(filename)
+                self.file_done.emit(filename, "success")
+            except Exception as e:
+                # Clean up partial output for this file
+                self._cleanup_files(created_files)
+                error_msg = f"{filename}: {e}"
+                failed.append(error_msg)
+                self.file_done.emit(filename, "failed")
+
+        self.finished.emit(succeeded, skipped, failed)
+
+    def _process_file(self, file_path, output_folder, created_files):
+        """Process a single sprite sheet file.
+
+        All created output file paths are appended to *created_files* so they
+        can be removed if an exception occurs later in the same call.
+        """
+        # Use local copies so padding adjustment doesn't leak across files
+        cell_width = self.cell_width
+        cell_height = self.cell_height
+
+        img = Image.open(file_path)
+
+        # Apply padding if needed
+        if self.padding > 0:
+            cols = img.size[0] // cell_width
+            rows = img.size[1] // cell_height
+            padded_width = cols * (cell_width + 2 * self.padding)
+            padded_height = rows * (cell_height + 2 * self.padding)
+            padded_img = Image.new(img.mode, (padded_width, padded_height), (0, 0, 0, 0))
+
+            for row in range(rows):
+                for col in range(cols):
+                    src_x = col * cell_width
+                    src_y = row * cell_height
+                    dst_x = col * (cell_width + 2 * self.padding) + self.padding
+                    dst_y = row * (cell_height + 2 * self.padding) + self.padding
+                    cell = img.crop(
+                        (src_x, src_y, src_x + cell_width, src_y + cell_height)
+                    )
+                    padded_img.paste(cell, (dst_x, dst_y))
+
+            img = padded_img
+            cell_width += 2 * self.padding
+            cell_height += 2 * self.padding
+
+        # Create output subfolder matching input structure
+        rel_path = os.path.relpath(os.path.dirname(file_path), self.input_folder)
+        curr_output = os.path.join(output_folder, rel_path)
+        os.makedirs(curr_output, exist_ok=True)
+
+        base_name = os.path.splitext(os.path.basename(file_path))[0]
+
+        # Export individual frames
+        if self.export_frames:
+            frames_folder = os.path.join(curr_output, f"{base_name}_frames")
+            os.makedirs(frames_folder, exist_ok=True)
+            cols = img.size[0] // cell_width
+            rows_count = img.size[1] // cell_height
+            frame_count = 0
+            for row in range(rows_count):
+                for col in range(cols):
+                    frame = img.crop(
+                        (col * cell_width, row * cell_height,
+                         (col + 1) * cell_width, (row + 1) * cell_height))
+                    out_path = os.path.join(frames_folder, f"frame_{frame_count:03d}.png")
+                    frame.save(out_path)
+                    created_files.append(out_path)
+                    frame_count += 1
+
+        # Export rows (strips / GIF / APNG)
+        if self.export_rows or self.export_gif or self.export_apng:
+            rows_folder = os.path.join(curr_output, f"{base_name}_rows")
+            os.makedirs(rows_folder, exist_ok=True)
+            rows_count = img.size[1] // cell_height
+            cols = img.size[0] // cell_width
+
+            for row in range(rows_count):
+                if self.export_rows:
+                    row_img = img.crop(
+                        (0, row * cell_height,
+                         img.size[0], (row + 1) * cell_height))
+                    out_path = os.path.join(rows_folder, f"row_{row:03d}.png")
+                    row_img.save(out_path)
+                    created_files.append(out_path)
+
+                if self.export_gif:
+                    frames = []
+                    for col in range(cols):
+                        frame = img.crop(
+                            (col * cell_width, row * cell_height,
+                             (col + 1) * cell_width, (row + 1) * cell_height))
+                        if frame.mode != 'RGBA':
+                            frame = frame.convert('RGBA')
+                        frames.append(frame)
+                    if frames:
+                        gif_path = os.path.join(rows_folder, f"row_{row:03d}.gif")
+                        frames[0].save(
+                            gif_path, format='GIF',
+                            append_images=frames[1:],
+                            save_all=True, duration=100,
+                            loop=0, transparency=0, disposal=2)
+                        created_files.append(gif_path)
+
+                if self.export_apng:
+                    frames = []
+                    for col in range(cols):
+                        frame = img.crop(
+                            (col * cell_width, row * cell_height,
+                             (col + 1) * cell_width, (row + 1) * cell_height))
+                        if frame.mode != 'RGBA':
+                            frame = frame.convert('RGBA')
+                        frames.append(np.array(frame))
+                    if frames:
+                        apng_path = os.path.join(rows_folder, f"row_{row:03d}_anim.png")
+                        imageio.mimsave(
+                            apng_path, frames, format='APNG',
+                            fps=10, loop=0, duration=100)
+                        created_files.append(apng_path)
+
+    @staticmethod
+    def _cleanup_files(file_paths):
+        """Remove files created during a failed/cancelled operation."""
+        for path in file_paths:
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except OSError:
+                pass
+
+
+class BatchResultDialog(QDialog):
+    """Summary dialog shown after batch processing completes."""
+
+    def __init__(self, succeeded, skipped, failed, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Batch Processing Results")
+        self.setMinimumSize(500, 400)
+
+        layout = QVBoxLayout(self)
+
+        # Summary label
+        total = len(succeeded) + len(skipped) + len(failed)
+        summary = (
+            f"Processed {total} file(s): "
+            f"{len(succeeded)} succeeded, "
+            f"{len(skipped)} skipped, "
+            f"{len(failed)} failed."
+        )
+        layout.addWidget(QLabel(summary))
+
+        # Tabbed detail views
+        tabs = QTabWidget()
+
+        ok_edit = QTextEdit()
+        ok_edit.setReadOnly(True)
+        ok_edit.setPlainText("\n".join(succeeded) if succeeded else "(none)")
+        tabs.addTab(ok_edit, f"Succeeded ({len(succeeded)})")
+
+        skip_edit = QTextEdit()
+        skip_edit.setReadOnly(True)
+        skip_edit.setPlainText("\n".join(skipped) if skipped else "(none)")
+        tabs.addTab(skip_edit, f"Skipped ({len(skipped)})")
+
+        fail_edit = QTextEdit()
+        fail_edit.setReadOnly(True)
+        fail_edit.setPlainText("\n".join(failed) if failed else "(none)")
+        tabs.addTab(fail_edit, f"Failed ({len(failed)})")
+
+        layout.addWidget(tabs)
+
+        # Select the most relevant tab
+        if failed:
+            tabs.setCurrentIndex(2)
+        elif skipped and not succeeded:
+            tabs.setCurrentIndex(1)
+
+        btn_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        btn_box.rejected.connect(self.accept)
+        layout.addWidget(btn_box)
+
+
 class SpriteToolz(QMainWindow):
     def __init__(self):
         super().__init__()
         self.initUI()
+        self.batch_worker = None
         
     def initUI(self):
         # Set window properties
@@ -1132,10 +1396,32 @@ class SpriteToolz(QMainWindow):
         # Progress group
         progress_group = QGroupBox("Progress")
         progress_layout = QVBoxLayout()
-        
+
         self.batch_progress_label = QLabel("Ready")
         progress_layout.addWidget(self.batch_progress_label)
-        
+
+        self.batch_progress_bar = QProgressBar()
+        self.batch_progress_bar.setValue(0)
+        progress_layout.addWidget(self.batch_progress_bar)
+
+        self.batch_current_file_label = QLabel("")
+        self.batch_current_file_label.setWordWrap(True)
+        progress_layout.addWidget(self.batch_current_file_label)
+
+        cancel_layout = QHBoxLayout()
+        self.cancel_batch_btn = QPushButton("Cancel")
+        self.cancel_batch_btn.setEnabled(False)
+        self.cancel_batch_btn.clicked.connect(self.cancel_batch)
+        cancel_layout.addWidget(self.cancel_batch_btn)
+        cancel_layout.addStretch()
+        progress_layout.addLayout(cancel_layout)
+
+        self.batch_result_text = QTextEdit()
+        self.batch_result_text.setReadOnly(True)
+        self.batch_result_text.setMaximumHeight(100)
+        self.batch_result_text.setPlaceholderText("Results will appear here...")
+        progress_layout.addWidget(self.batch_result_text)
+
         progress_group.setLayout(progress_layout)
         batch_layout.addWidget(progress_group)
         
@@ -1743,12 +2029,12 @@ class SpriteToolz(QMainWindow):
             self.statusBar().showMessage(f"Selected folder: {folder}")
             
     def process_batch(self):
-        """Process all sprite sheets in the selected folder"""
+        """Launch batch processing on a background worker thread."""
         input_folder = self.input_folder_label.text()
         if input_folder == "No folder selected":
             return
-            
-        # Get processing options
+
+        # Gather options from UI
         cell_width = self.batch_cell_width_spin.value()
         cell_height = self.batch_cell_height_spin.value()
         padding = self.batch_padding_spin.value()
@@ -1757,173 +2043,73 @@ class SpriteToolz(QMainWindow):
         export_gif = self.export_gif_cb.isChecked()
         export_apng = self.export_apng_cb.isChecked()
         include_subfolders = self.include_subfolders_cb.isChecked()
-        
-        # Create output folder
-        output_folder = os.path.join(input_folder, "processed")
-        os.makedirs(output_folder, exist_ok=True)
-        
-        # Get list of files to process
-        if include_subfolders:
-            sprite_files = []
-            for root, _, files in os.walk(input_folder):
-                for file in files:
-                    if file.lower().endswith(('.png', '.jpg', '.bmp', '.gif')):
-                        sprite_files.append(os.path.join(root, file))
+
+        # Create worker
+        self.batch_worker = BatchWorker(
+            input_folder, cell_width, cell_height, padding,
+            export_frames, export_rows, export_gif, export_apng,
+            include_subfolders)
+
+        # Connect signals
+        self.batch_worker.progress.connect(self._on_batch_progress)
+        self.batch_worker.file_done.connect(self._on_batch_file_done)
+        self.batch_worker.finished.connect(self._on_batch_finished)
+
+        # Lock UI for batch mode
+        self.process_batch_btn.setEnabled(False)
+        self.cancel_batch_btn.setEnabled(True)
+        self.batch_progress_bar.setValue(0)
+        self.batch_progress_bar.setMaximum(0)  # indeterminate until first progress signal
+        self.batch_current_file_label.setText("")
+        self.batch_result_text.clear()
+        self.batch_progress_label.setText("Starting...")
+        self.statusBar().showMessage("Batch processing started")
+
+        self.batch_worker.start()
+
+    def cancel_batch(self):
+        """Request cancellation of the running batch worker."""
+        if self.batch_worker and self.batch_worker.isRunning():
+            self.batch_worker.cancel()
+            self.cancel_batch_btn.setEnabled(False)
+            self.batch_progress_label.setText("Cancelling...")
+            self.statusBar().showMessage("Cancelling batch processing...")
+
+    def _on_batch_progress(self, current, total, filename):
+        """Slot: worker reports progress for a new file."""
+        self.batch_progress_bar.setMaximum(total)
+        self.batch_progress_bar.setValue(current)
+        self.batch_progress_label.setText(f"Processing {current}/{total}")
+        self.batch_current_file_label.setText(filename)
+        self.statusBar().showMessage(f"Processing: {filename}")
+
+    def _on_batch_file_done(self, filename, status):
+        """Slot: worker finished processing one file."""
+        icon = {"success": "OK", "skipped": "SKIP", "failed": "FAIL"}.get(status, "?")
+        self.batch_result_text.append(f"[{icon}] {filename}")
+
+    def _on_batch_finished(self, succeeded, skipped, failed):
+        """Slot: worker thread finished all processing."""
+        self.process_batch_btn.setEnabled(True)
+        self.cancel_batch_btn.setEnabled(False)
+        self.batch_worker = None
+
+        cancelled = any("(cancelled)" in s for s in skipped)
+        if cancelled:
+            self.batch_progress_label.setText("Cancelled")
+            self.statusBar().showMessage("Batch processing cancelled")
+        elif failed:
+            self.batch_progress_label.setText("Completed with errors")
+            self.statusBar().showMessage("Batch processing completed with errors")
         else:
-            sprite_files = [
-                os.path.join(input_folder, f) for f in os.listdir(input_folder)
-                if f.lower().endswith(('.png', '.jpg', '.bmp', '.gif'))
-            ]
-        
-        if not sprite_files:
-            self.batch_progress_label.setText("No sprite sheets found")
-            return
-            
-        # Process each file
-        total_files = len(sprite_files)
-        for i, file_path in enumerate(sprite_files, 1):
-            self.batch_progress_label.setText(f"Processing {i}/{total_files}: {os.path.basename(file_path)}")
-            self.statusBar().showMessage(f"Processing {os.path.basename(file_path)}")
-            QApplication.processEvents()  # Update UI
-            
-            try:
-                # Load sprite sheet
-                img = Image.open(file_path)
-                
-                # Apply padding if needed
-                if padding > 0:
-                    # Calculate cells
-                    cols = img.size[0] // cell_width
-                    rows = img.size[1] // cell_height
-                    
-                    # Create padded image
-                    padded_width = cols * (cell_width + 2 * padding)
-                    padded_height = rows * (cell_height + 2 * padding)
-                    padded_img = Image.new(img.mode, (padded_width, padded_height), (0, 0, 0, 0))
-                    
-                    # Copy cells with padding
-                    for row in range(rows):
-                        for col in range(cols):
-                            src_x = col * cell_width
-                            src_y = row * cell_height
-                            dst_x = col * (cell_width + 2 * padding) + padding
-                            dst_y = row * (cell_height + 2 * padding) + padding
-                            
-                            cell = img.crop(
-                                (src_x, src_y, src_x + cell_width, src_y + cell_height)
-                            )
-                            padded_img.paste(cell, (dst_x, dst_y))
-                            
-                    img = padded_img
-                    cell_width += 2 * padding
-                    cell_height += 2 * padding
-                
-                # Create output subfolder matching input structure
-                rel_path = os.path.relpath(os.path.dirname(file_path), input_folder)
-                curr_output_folder = os.path.join(output_folder, rel_path)
-                os.makedirs(curr_output_folder, exist_ok=True)
-                
-                base_name = os.path.splitext(os.path.basename(file_path))[0]
-                
-                # Export individual frames if requested
-                if export_frames:
-                    frames_folder = os.path.join(curr_output_folder, f"{base_name}_frames")
-                    os.makedirs(frames_folder, exist_ok=True)
-                    
-                    cols = img.size[0] // cell_width
-                    rows = img.size[1] // cell_height
-                    frame_count = 0
-                    
-                    for row in range(rows):
-                        for col in range(cols):
-                            frame = img.crop(
-                                (col * cell_width, row * cell_height,
-                                 (col + 1) * cell_width, (row + 1) * cell_height))
-                            frame.save(os.path.join(frames_folder, f"frame_{frame_count:03d}.png"))
-                            frame_count += 1
-                
-                # Export rows if requested
-                if export_rows or export_gif or export_apng:
-                    rows_folder = os.path.join(curr_output_folder, f"{base_name}_rows")
-                    os.makedirs(rows_folder, exist_ok=True)
-                    
-                    rows = img.size[1] // cell_height
-                    cols = img.size[0] // cell_width
-                    
-                    for row in range(rows):
-                        # Export row as strip if requested
-                        if export_rows:
-                            row_img = img.crop(
-                                (0, row * cell_height,
-                                 img.size[0], (row + 1) * cell_height))
-                            row_img.save(os.path.join(rows_folder, f"row_{row:03d}.png"))
-                        
-                        # Export as GIF if requested
-                        if export_gif:
-                            frames = []
-                            for col in range(cols):
-                                frame = img.crop(
-                                    (col * cell_width, row * cell_height,
-                                     (col + 1) * cell_width, (row + 1) * cell_height))
-                                # Convert frame to RGBA if it isn't already
-                                if frame.mode != 'RGBA':
-                                    frame = frame.convert('RGBA')
-                                frames.append(frame)
-                            
-                            if frames:
-                                try:
-                                    gif_path = os.path.join(rows_folder, f"row_{row:03d}.gif")
-                                    frames[0].save(
-                                        gif_path,
-                                        format='GIF',
-                                        append_images=frames[1:],
-                                        save_all=True,
-                                        duration=100,
-                                        loop=0,
-                                        transparency=0,
-                                        disposal=2  # Clear previous frame
-                                    )
-                                    self.statusBar().showMessage(f"Created GIF: {os.path.basename(gif_path)}")
-                                except Exception as e:
-                                    self.statusBar().showMessage(f"Error creating GIF for row {row}: {str(e)}")
-                        
-                        # Export as APNG if requested
-                        if export_apng:
-                            frames = []
-                            for col in range(cols):
-                                frame = img.crop(
-                                    (col * cell_width, row * cell_height,
-                                     (col + 1) * cell_width, (row + 1) * cell_height))
-                                # Convert frame to RGBA if it isn't already
-                                if frame.mode != 'RGBA':
-                                    frame = frame.convert('RGBA')
-                                frames.append(np.array(frame))
-                            
-                            if frames:
-                                try:
-                                    apng_path = os.path.join(rows_folder, f"row_{row:03d}.png")
-                                    # Save as animated PNG with proper animation settings
-                                    imageio.mimsave(
-                                        apng_path,
-                                        frames,
-                                        format='APNG',
-                                        fps=10,  # 10 frames per second
-                                        loop=0,  # Loop forever
-                                        duration=100  # 100ms per frame
-                                    )
-                                    self.statusBar().showMessage(f"Created animated PNG for row {row}")
-                                except Exception as e:
-                                    self.statusBar().showMessage(f"Error creating animated PNG for row {row}: {str(e)}")
-                                    continue
-                
-            except Exception as e:
-                error_msg = f"Error processing {os.path.basename(file_path)}: {str(e)}"
-                self.statusBar().showMessage(error_msg)
-                self.batch_progress_label.setText(error_msg)
-                continue
-        
-        self.batch_progress_label.setText("Processing complete")
-        self.statusBar().showMessage("Batch processing complete")
+            self.batch_progress_label.setText("Completed")
+            self.statusBar().showMessage("Batch processing completed")
+
+        self.batch_current_file_label.setText("")
+
+        # Show summary dialog
+        dlg = BatchResultDialog(succeeded, skipped, failed, self)
+        dlg.exec()
 
 
 def main():
