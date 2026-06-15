@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import sys
 import os
+import json
 import numpy as np
 from PIL import Image
 import imageio
@@ -25,6 +26,9 @@ class SpriteCanvas(QLabel):
         self.grid_color = QColor(255, 0, 0, 128)  # Semi-transparent red
         self.padding = 0
         self.padding_preview = 0  # New variable for padding preview
+        self.image_path = None  # Path of the currently loaded sprite sheet (for projects)
+        self.frame_duration = 100  # Animation frame duration in milliseconds
+        self.loop_count = 0  # Animation loop count (0 = loop forever)
         self.setMinimumSize(800, 600)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setMouseTracking(True)  # Enable mouse tracking for hover effects
@@ -54,6 +58,7 @@ class SpriteCanvas(QLabel):
         self.sprite_image = Image.open(filename)
         self.original_image = self.sprite_image.copy()  # Store original image
         self.spritesheet = np.array(self.sprite_image)
+        self.image_path = filename  # Remember the source path for project files
         self.update_pixmap()
         
     def update_pixmap(self):
@@ -594,8 +599,8 @@ class SpriteCanvas(QLabel):
                 format='GIF',
                 append_images=frames[1:],
                 save_all=True,
-                duration=100,  # 100ms per frame
-                loop=0  # Loop forever
+                duration=self.frame_duration,  # ms per frame (from animation settings)
+                loop=self.loop_count  # 0 = loop forever
             )
             return True
             
@@ -657,7 +662,8 @@ class SpriteCanvas(QLabel):
         
         # Save frames as APNG
         if frames:
-            imageio.mimsave(filename, frames, format='APNG', fps=10)
+            imageio.mimsave(filename, frames, format='APNG',
+                            duration=self.frame_duration, loop=self.loop_count)
             return True
             
         return False
@@ -823,6 +829,14 @@ class SpriteToolz(QMainWindow):
         self.load_button = QPushButton("Load Sprite Sheet")
         self.load_button.clicked.connect(self.load_spritesheet)
         file_layout.addWidget(self.load_button)
+
+        self.save_project_button = QPushButton("Save Project")
+        self.save_project_button.clicked.connect(self.save_project)
+        file_layout.addWidget(self.save_project_button)
+
+        self.load_project_button = QPushButton("Load Project")
+        self.load_project_button.clicked.connect(self.load_project)
+        file_layout.addWidget(self.load_project_button)
         
         # Export options group
         export_group = QGroupBox("Export Options")
@@ -843,7 +857,28 @@ class SpriteToolz(QMainWindow):
         
         self.export_format_group.setLayout(format_layout)
         export_layout.addWidget(self.export_format_group)
-        
+
+        # Animation settings (apply to GIF/APNG export and are stored in projects)
+        anim_group = QGroupBox("Animation Settings")
+        anim_layout = QGridLayout()
+
+        anim_layout.addWidget(QLabel("Frame Duration (ms):"), 0, 0)
+        self.frame_duration_spin = QSpinBox()
+        self.frame_duration_spin.setRange(10, 60000)
+        self.frame_duration_spin.setValue(100)
+        self.frame_duration_spin.valueChanged.connect(self.update_animation_params)
+        anim_layout.addWidget(self.frame_duration_spin, 0, 1)
+
+        anim_layout.addWidget(QLabel("Loop (0=forever):"), 1, 0)
+        self.loop_count_spin = QSpinBox()
+        self.loop_count_spin.setRange(0, 9999)
+        self.loop_count_spin.setValue(0)
+        self.loop_count_spin.valueChanged.connect(self.update_animation_params)
+        anim_layout.addWidget(self.loop_count_spin, 1, 1)
+
+        anim_group.setLayout(anim_layout)
+        export_layout.addWidget(anim_group)
+
         self.export_button = QPushButton("Export Selection")
         self.export_button.clicked.connect(self.export_selection)
         self.export_button.setEnabled(False)
@@ -1166,13 +1201,387 @@ class SpriteToolz(QMainWindow):
         
         if filename:
             self.sprite_canvas.load_spritesheet(filename)
-            self.export_button.setEnabled(True)
-            # Enable zoom buttons
-            self.zoom_in_button.setEnabled(True)
-            self.zoom_out_button.setEnabled(True)
-            self.zoom_reset_button.setEnabled(True)
+            self._enable_image_controls()
             self.statusBar().showMessage(f"Loaded: {filename}")
-    
+
+    def _enable_image_controls(self):
+        """Enable controls that require a loaded sprite sheet."""
+        self.export_button.setEnabled(True)
+        self.zoom_in_button.setEnabled(True)
+        self.zoom_out_button.setEnabled(True)
+        self.zoom_reset_button.setEnabled(True)
+
+    def update_animation_params(self):
+        """Push animation settings from the UI spinboxes to the canvas."""
+        self.sprite_canvas.frame_duration = self.frame_duration_spin.value()
+        self.sprite_canvas.loop_count = self.loop_count_spin.value()
+
+    # ----- Project save / load -----
+
+    def _get_export_format(self):
+        """Return the currently selected export format as a string."""
+        if self.frames_radio.isChecked():
+            return "frames"
+        if self.animation_radio.isChecked():
+            return "animation"
+        return "strip"
+
+    def _collect_project_data(self):
+        """Gather all project settings into a serializable dictionary."""
+        canvas = self.sprite_canvas
+        color = canvas.grid_color
+        return {
+            "version": 1,
+            "app": "Sprite Toolz",
+            "image_path": canvas.image_path,
+            "cell": {
+                "mode": "count" if self.cell_size_mode_cb.isChecked() else "manual",
+                "width": self.cell_width_spin.value(),
+                "height": self.cell_height_spin.value(),
+                "rows": self.row_count_spin.value(),
+                "columns": self.col_count_spin.value(),
+            },
+            "padding": self.padding_spin.value(),
+            "grid": {
+                "visible": self.show_grid_checkbox.isChecked(),
+                "color": [color.red(), color.green(), color.blue(), color.alpha()],
+            },
+            "zoom_index": canvas.current_zoom_index,
+            "selection": {
+                "is_custom": canvas.is_custom_selecting,
+                "custom_frames": [[int(c), int(r)] for c, r in canvas.custom_frame_selection],
+                "cells": [[int(c), int(r)] for c, r in canvas.selected_cells],
+                "row": canvas.selected_row,
+                "column": canvas.selected_column,
+            },
+            "animation": {
+                "frame_duration_ms": self.frame_duration_spin.value(),
+                "loop": self.loop_count_spin.value(),
+            },
+            "export": {
+                "format": self._get_export_format(),
+            },
+        }
+
+    def save_project(self):
+        """Save the current project settings to a JSON file."""
+        filename, _ = QFileDialog.getSaveFileName(
+            self, "Save Project", "", "Sprite Toolz Project (*.json);;All Files (*)"
+        )
+        if not filename:
+            return
+        if not filename.lower().endswith(".json"):
+            filename += ".json"
+        try:
+            data = self._collect_project_data()
+            with open(filename, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            self.statusBar().showMessage(f"Project saved to: {filename}")
+        except Exception as e:
+            QMessageBox.warning(self, "Save Failed", f"Could not save project:\n{str(e)}")
+
+    @staticmethod
+    def _coerce_int(value, default, low, high):
+        """Coerce value to an int within [low, high]. Returns (value, changed)."""
+        if isinstance(value, bool):  # bool is a subclass of int; reject it
+            return default, True
+        try:
+            v = int(value)
+        except (TypeError, ValueError):
+            return default, True
+        clamped = max(low, min(high, v))
+        return clamped, clamped != v
+
+    def _validate_project(self, data):
+        """Validate/normalize project data with type and range checks.
+
+        Missing fields fall back to defaults (older project files stay
+        compatible). Returns (clean_data, warnings).
+        """
+        if not isinstance(data, dict):
+            raise ValueError("Project file does not contain a valid project object.")
+
+        warnings = []
+
+        # --- Image path ---
+        image_path = data.get("image_path")
+        if image_path is not None and not isinstance(image_path, str):
+            warnings.append("Stored image path was invalid; ignoring it.")
+            image_path = None
+
+        # --- Cell / grid size ---
+        cell_in = data.get("cell")
+        if not isinstance(cell_in, dict):
+            if cell_in is not None:
+                warnings.append("Invalid 'cell' section; using defaults.")
+            cell_in = {}
+        mode = cell_in.get("mode", "manual")
+        if mode not in ("manual", "count"):
+            warnings.append(f"Unknown cell mode '{mode}'; using 'manual'.")
+            mode = "manual"
+        width, ch = self._coerce_int(cell_in.get("width", 32), 32, 1, 1000)
+        if ch:
+            warnings.append("Cell width was invalid/out of range; adjusted.")
+        height, ch = self._coerce_int(cell_in.get("height", 32), 32, 1, 1000)
+        if ch:
+            warnings.append("Cell height was invalid/out of range; adjusted.")
+        rows, ch = self._coerce_int(cell_in.get("rows", 1), 1, 1, 1000)
+        if ch:
+            warnings.append("Row count was invalid/out of range; adjusted.")
+        columns, ch = self._coerce_int(cell_in.get("columns", 1), 1, 1, 1000)
+        if ch:
+            warnings.append("Column count was invalid/out of range; adjusted.")
+
+        # --- Padding ---
+        padding, ch = self._coerce_int(data.get("padding", 0), 0, 0, 100)
+        if ch:
+            warnings.append("Padding was invalid/out of range; adjusted.")
+
+        # --- Grid display ---
+        grid_in = data.get("grid")
+        if not isinstance(grid_in, dict):
+            grid_in = {}
+        visible = bool(grid_in.get("visible", True))
+        rgba = [255, 0, 0, 128]
+        color = grid_in.get("color", rgba)
+        if isinstance(color, (list, tuple)) and len(color) == 4:
+            channels = []
+            bad = False
+            for chv in color:
+                cv, changed = self._coerce_int(chv, 0, 0, 255)
+                if changed:
+                    bad = True
+                channels.append(cv)
+            rgba = channels
+            if bad:
+                warnings.append("Grid color contained invalid values; clamped.")
+        elif color is not None:
+            warnings.append("Invalid grid color; using default red.")
+
+        # --- Zoom ---
+        max_zoom = len(self.sprite_canvas.zoom_levels) - 1
+        zoom_index, ch = self._coerce_int(data.get("zoom_index", 0), 0, 0, max_zoom)
+        if ch:
+            warnings.append("Zoom level was invalid/out of range; adjusted.")
+
+        # --- Selection ---
+        sel_in = data.get("selection")
+        if not isinstance(sel_in, dict):
+            sel_in = {}
+
+        def clean_pairs(seq):
+            result = []
+            if isinstance(seq, (list, tuple)):
+                for item in seq:
+                    if isinstance(item, (list, tuple)) and len(item) == 2:
+                        c0, _ = self._coerce_int(item[0], None, -100000, 100000)
+                        c1, _ = self._coerce_int(item[1], None, -100000, 100000)
+                        if c0 is not None and c1 is not None:
+                            result.append((c0, c1))
+            return result
+
+        custom_frames = clean_pairs(sel_in.get("custom_frames", []))
+        cells = clean_pairs(sel_in.get("cells", []))
+        is_custom = bool(sel_in.get("is_custom", False))
+        sel_row, _ = self._coerce_int(sel_in.get("row", -1), -1, -1, 100000)
+        sel_col, _ = self._coerce_int(sel_in.get("column", -1), -1, -1, 100000)
+
+        # --- Animation ---
+        anim_in = data.get("animation")
+        if not isinstance(anim_in, dict):
+            anim_in = {}
+        frame_duration, ch = self._coerce_int(anim_in.get("frame_duration_ms", 100), 100, 10, 60000)
+        if ch:
+            warnings.append("Frame duration was invalid/out of range; adjusted.")
+        loop, ch = self._coerce_int(anim_in.get("loop", 0), 0, 0, 9999)
+        if ch:
+            warnings.append("Loop count was invalid/out of range; adjusted.")
+
+        # --- Export settings ---
+        export_in = data.get("export")
+        if not isinstance(export_in, dict):
+            export_in = {}
+        fmt = export_in.get("format", "strip")
+        if fmt not in ("strip", "frames", "animation"):
+            warnings.append(f"Unknown export format '{fmt}'; using 'strip'.")
+            fmt = "strip"
+
+        clean = {
+            "image_path": image_path,
+            "cell": {"mode": mode, "width": width, "height": height,
+                     "rows": rows, "columns": columns},
+            "padding": padding,
+            "grid": {"visible": visible, "color": rgba},
+            "zoom_index": zoom_index,
+            "selection": {"is_custom": is_custom, "custom_frames": custom_frames,
+                          "cells": cells, "row": sel_row, "column": sel_col},
+            "animation": {"frame_duration_ms": frame_duration, "loop": loop},
+            "export": {"format": fmt},
+        }
+        return clean, warnings
+
+    def _resolve_missing_image(self, original_path):
+        """Prompt the user to relocate a missing source image.
+
+        Returns the chosen path, or None if the user declines (settings are
+        still applied without an image).
+        """
+        shown = original_path if original_path else "(no path stored)"
+        reply = QMessageBox.question(
+            self, "Image Not Found",
+            f"The project's source image could not be found:\n{shown}\n\n"
+            "Would you like to locate the image now?\n"
+            "Choosing 'No' loads the project settings without an image.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return None
+        new_path, _ = QFileDialog.getOpenFileName(
+            self, "Locate Sprite Sheet", "", "Image Files (*.png *.jpg *.bmp *.gif)"
+        )
+        return new_path if new_path else None
+
+    def load_project(self):
+        """Load project settings from a JSON file, validating and relocating as needed."""
+        filename, _ = QFileDialog.getOpenFileName(
+            self, "Load Project", "", "Sprite Toolz Project (*.json);;All Files (*)"
+        )
+        if not filename:
+            return
+
+        try:
+            with open(filename, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+        except json.JSONDecodeError as e:
+            QMessageBox.warning(self, "Load Failed", f"Project file is not valid JSON:\n{str(e)}")
+            return
+        except Exception as e:
+            QMessageBox.warning(self, "Load Failed", f"Could not read project file:\n{str(e)}")
+            return
+
+        try:
+            clean, warnings = self._validate_project(raw)
+        except ValueError as e:
+            QMessageBox.warning(self, "Load Failed", str(e))
+            return
+
+        # Resolve the source image, prompting for relocation if its path is invalid.
+        image_path = clean["image_path"]
+        resolved_path = image_path
+        if not image_path or not os.path.isfile(image_path):
+            resolved_path = self._resolve_missing_image(image_path)
+
+        if resolved_path:
+            try:
+                self.sprite_canvas.load_spritesheet(resolved_path)
+                self._enable_image_controls()
+            except Exception as e:
+                QMessageBox.warning(
+                    self, "Image Load Failed",
+                    f"Could not load image:\n{str(e)}\n\nProject settings will still be applied."
+                )
+
+        # Apply every other setting regardless of image outcome.
+        self._apply_project_data(clean)
+
+        if warnings:
+            QMessageBox.information(
+                self, "Project Loaded With Adjustments",
+                "The project was loaded, but some values were adjusted:\n\n- "
+                + "\n- ".join(warnings)
+            )
+        self.statusBar().showMessage(f"Project loaded from: {filename}")
+
+    def _apply_project_data(self, data):
+        """Apply validated project settings to the UI controls and canvas."""
+        canvas = self.sprite_canvas
+
+        # Update spinboxes/checkboxes without triggering their change handlers.
+        blocked = [self.cell_width_spin, self.cell_height_spin,
+                   self.row_count_spin, self.col_count_spin,
+                   self.padding_spin, self.cell_size_mode_cb,
+                   self.show_grid_checkbox, self.frame_duration_spin,
+                   self.loop_count_spin]
+        for widget in blocked:
+            widget.blockSignals(True)
+
+        cell = data["cell"]
+        self.cell_width_spin.setValue(cell["width"])
+        self.cell_height_spin.setValue(cell["height"])
+        self.row_count_spin.setValue(cell["rows"])
+        self.col_count_spin.setValue(cell["columns"])
+
+        use_count = cell["mode"] == "count"
+        self.cell_size_mode_cb.setChecked(use_count)
+        if use_count:
+            self.manual_size_widget.hide()
+            self.count_size_widget.show()
+        else:
+            self.manual_size_widget.show()
+            self.count_size_widget.hide()
+
+        self.padding_spin.setValue(data["padding"])
+        self.show_grid_checkbox.setChecked(data["grid"]["visible"])
+        self.frame_duration_spin.setValue(data["animation"]["frame_duration_ms"])
+        self.loop_count_spin.setValue(data["animation"]["loop"])
+
+        for widget in blocked:
+            widget.blockSignals(False)
+
+        # Push state onto the canvas.
+        canvas.cell_width = cell["width"]
+        canvas.cell_height = cell["height"]
+        canvas.show_grid = data["grid"]["visible"]
+        r, g, b, a = data["grid"]["color"]
+        canvas.grid_color = QColor(r, g, b, a)
+        canvas.frame_duration = data["animation"]["frame_duration_ms"]
+        canvas.loop_count = data["animation"]["loop"]
+        canvas.padding = 0
+        canvas.padding_preview = 0
+
+        # Export format radio.
+        fmt = data["export"]["format"]
+        if fmt == "frames":
+            self.frames_radio.setChecked(True)
+        elif fmt == "animation":
+            self.animation_radio.setChecked(True)
+        else:
+            self.strip_radio.setChecked(True)
+
+        # Selection (frame selection order is preserved for custom selections).
+        sel = data["selection"]
+        canvas.custom_frame_selection = [tuple(p) for p in sel["custom_frames"]]
+        canvas.is_custom_selecting = sel["is_custom"]
+        if sel["is_custom"]:
+            canvas.selected_cells = list(canvas.custom_frame_selection)
+            canvas.selected_row = -1
+            canvas.selected_column = -1
+            canvas.selection_start = None
+            canvas.selection_end = None
+        else:
+            canvas.selected_cells = [tuple(p) for p in sel["cells"]]
+            canvas.selected_row = sel["row"]
+            canvas.selected_column = sel["column"]
+            if canvas.selected_cells:
+                canvas.selection_start = canvas.selected_cells[0]
+                canvas.selection_end = canvas.selected_cells[-1]
+            else:
+                canvas.selection_start = None
+                canvas.selection_end = None
+
+        # Zoom (set_zoom refreshes the pixmap).
+        canvas.set_zoom(data["zoom_index"])
+        self.zoom_label.setText(f"Zoom: {int(canvas.zoom_factor)}x")
+
+        # Re-apply padding preview if requested and an image is present.
+        if canvas.sprite_image is not None and data["padding"] > 0:
+            self.update_padding()
+
+        canvas.update()
+        self.update_selection_label()
+        self.update_button_states()
+
     def export_selection(self):
         if self.sprite_canvas.sprite_image is None or not self.sprite_canvas.selected_cells:
             QMessageBox.warning(self, "No Selection", "Please select cells to export.")

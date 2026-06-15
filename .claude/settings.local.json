@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python _tmp_test_project.py)",
+      "Bash(rm -f _tmp_test_project.py)",
+      "Bash(rm -rf __pycache__)"
+    ]
+  }
+}
