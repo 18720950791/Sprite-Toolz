@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''sprite_toolz.py''\\).read\\(\\)\\); print\\(''parse ok''\\)\")",
+      "Bash(QT_QPA_PLATFORM=offscreen python - <<'PY':*)"
+    ]
+  }
+}

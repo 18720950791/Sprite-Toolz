@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import sys
 import os
+import functools
 import numpy as np
 from PIL import Image
 import imageio
@@ -10,7 +11,11 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QLabel, QScrollArea,
                             QGridLayout, QGroupBox, QSlider, QFrame, QSizePolicy,
                             QMessageBox, QTabWidget, QRadioButton)
 from PyQt6.QtGui import QPixmap, QPainter, QPen, QColor, QImage, QCursor
-from PyQt6.QtCore import Qt, QRect, QSize, QPoint
+from PyQt6.QtCore import Qt, QRect, QSize, QPoint, QTimer
+
+
+# Default per-frame animation duration in milliseconds (used when a frame has no custom duration)
+DEFAULT_FRAME_DURATION = 100
 
 
 class SpriteCanvas(QLabel):
@@ -49,7 +54,12 @@ class SpriteCanvas(QLabel):
         # Add custom frame selection variables
         self.custom_frame_selection = []  # List to store frames in selection order
         self.is_custom_selecting = False  # Flag for custom selection mode
-        
+
+        # Animation timing: per-frame durations {(col, row): milliseconds} and loop count.
+        # Empty frame_durations means every frame uses DEFAULT_FRAME_DURATION (legacy behavior).
+        self.frame_durations = {}
+        self.loop_count = 0  # 0 = loop forever (matches GIF/APNG loop field semantics)
+
     def load_spritesheet(self, filename):
         self.sprite_image = Image.open(filename)
         self.original_image = self.sprite_image.copy()  # Store original image
@@ -165,6 +175,8 @@ class SpriteCanvas(QLabel):
                 self.parent().parent().parent().update_selection_label()
             if hasattr(self.parent().parent().parent(), 'update_button_states'):
                 self.parent().parent().parent().update_button_states()
+            if hasattr(self.parent().parent().parent(), 'refresh_timing_panel'):
+                self.parent().parent().parent().refresh_timing_panel()
     
     def mouseMoveEvent(self, event):
         if self.sprite_image is None or self.is_custom_selecting:
@@ -208,6 +220,8 @@ class SpriteCanvas(QLabel):
                 self.parent().parent().parent().update_selection_label()
             if hasattr(self.parent().parent().parent(), 'update_button_states'):
                 self.parent().parent().parent().update_button_states()
+            if hasattr(self.parent().parent().parent(), 'refresh_timing_panel'):
+                self.parent().parent().parent().refresh_timing_panel()
     
     def update_selection(self):
         if self.is_custom_selecting:
@@ -536,131 +550,105 @@ class SpriteCanvas(QLabel):
         self.update_pixmap()
         return True
         
-    def export_selection_as_gif(self, filename):
-        if not self.selected_cells or self.sprite_image is None:
-            return False
-            
-        # Extract selected cells as frames
-        frames = []
-        
-        # If using custom frame selection, use the frames in selection order
-        if self.is_custom_selecting:
-            for col, row in self.custom_frame_selection:
-                # Extract the frame
-                x = col * self.cell_width
-                y = row * self.cell_height
-                frame = self.sprite_image.crop(
-                    (x, y, x + self.cell_width, y + self.cell_height)
-                )
-                frames.append(frame)
+    def get_ordered_selection(self):
+        """Return the selected cells as a list of (col, row) in playback order.
+
+        Consolidates the per-case logic the exporters used to duplicate:
+        a custom selection keeps click order; a selected row plays left->right;
+        a selected column plays top->bottom; otherwise cells are read row-major.
+        """
+        if self.sprite_image is None:
+            return []
+        if self.is_custom_selecting and self.custom_frame_selection:
+            return list(self.custom_frame_selection)
+        if self.selected_row >= 0:
+            max_cols = self.sprite_image.size[0] // self.cell_width
+            return [(col, self.selected_row) for col in range(max_cols)]
+        if self.selected_column >= 0:
+            max_rows = self.sprite_image.size[1] // self.cell_height
+            return [(self.selected_column, row) for row in range(max_rows)]
+        if self.selected_cells:
+            return sorted(self.selected_cells, key=lambda c: (c[1], c[0]))
+        return []
+
+    def crop_frame(self, col, row):
+        """Crop a single cell as an RGBA PIL image."""
+        x = col * self.cell_width
+        y = row * self.cell_height
+        frame = self.sprite_image.crop((x, y, x + self.cell_width, y + self.cell_height))
+        if frame.mode != 'RGBA':
+            frame = frame.convert('RGBA')
+        return frame
+
+    def get_selection_frames_and_durations(self, order=None):
+        """Return (frames, durations) for the current selection in playback order.
+
+        durations[i] falls back to DEFAULT_FRAME_DURATION when a frame has no
+        custom value, so an empty frame_durations reproduces the legacy fixed rate.
+        """
+        if order is None:
+            order = self.get_ordered_selection()
+        frames = [self.crop_frame(col, row) for (col, row) in order]
+        durations = [self.frame_durations.get((col, row), DEFAULT_FRAME_DURATION)
+                     for (col, row) in order]
+        return frames, durations
+
+    def _pil_to_pixmap(self, img):
+        """Convert an RGBA/RGB PIL image to a QPixmap (same conversion as update_pixmap)."""
+        if img.mode == 'RGBA':
+            data = img.tobytes("raw", "RGBA")
+            qim = QImage(data, img.size[0], img.size[1],
+                         img.size[0] * 4, QImage.Format.Format_RGBA8888)
+        elif img.mode == 'RGB':
+            data = img.tobytes("raw", "RGB")
+            qim = QImage(data, img.size[0], img.size[1],
+                         img.size[0] * 3, QImage.Format.Format_RGB888)
         else:
-            # If a row is selected, export frames horizontally
-            if self.selected_row >= 0:
-                row = self.selected_row
-                max_cols = self.sprite_image.size[0] // self.cell_width
-                
-                for col in range(max_cols):
-                    # Extract the frame
-                    x = col * self.cell_width
-                    y = row * self.cell_height
-                    frame = self.sprite_image.crop(
-                        (x, y, x + self.cell_width, y + self.cell_height)
-                    )
-                    frames.append(frame)
-                
-            # If a column is selected, export frames vertically
-            elif self.selected_column >= 0:
-                col = self.selected_column
-                max_rows = self.sprite_image.size[1] // self.cell_height
-                
-                for row in range(max_rows):
-                    # Extract the frame
-                    x = col * self.cell_width
-                    y = row * self.cell_height
-                    frame = self.sprite_image.crop(
-                        (x, y, x + self.cell_width, y + self.cell_height)
-                    )
-                    frames.append(frame)
-                
-            # If a custom selection is made, export frames in reading order
-            else:
-                # Sort cells by row then column for reading order
-                cells = sorted(self.selected_cells, key=lambda c: (c[1], c[0]))
-        
-        # Save frames as GIF animation
-        if frames:
-            frames[0].save(
-                filename,
-                format='GIF',
-                append_images=frames[1:],
-                save_all=True,
-                duration=100,  # 100ms per frame
-                loop=0  # Loop forever
-            )
-            return True
-            
-        return False
+            converted = img.convert('RGBA')
+            data = converted.tobytes("raw", "RGBA")
+            qim = QImage(data, converted.size[0], converted.size[1],
+                         converted.size[0] * 4, QImage.Format.Format_RGBA8888)
+        return QPixmap.fromImage(qim)
+
+    def export_selection_as_gif(self, filename):
+        order = self.get_ordered_selection()
+        if self.sprite_image is None or not order:
+            return False
+
+        frames, durations = self.get_selection_frames_and_durations(order)
+
+        # Per-frame durations (ms) and loop_count are shared with the APNG export.
+        # Empty frame_durations -> all DEFAULT_FRAME_DURATION; loop_count 0 -> legacy output.
+        frames[0].save(
+            filename,
+            format='GIF',
+            append_images=frames[1:],
+            save_all=True,
+            duration=durations,
+            loop=self.loop_count,
+            disposal=2  # clear previous frame for clean transparency
+        )
+        return True
         
     def export_selection_as_apng(self, filename):
-        if not self.selected_cells or self.sprite_image is None:
+        order = self.get_ordered_selection()
+        if self.sprite_image is None or not order:
             return False
-            
-        # Extract selected cells as frames
-        frames = []
-        
-        # If using custom frame selection, use the frames in selection order
-        if self.is_custom_selecting:
-            for col, row in self.custom_frame_selection:
-                # Extract the frame
-                x = col * self.cell_width
-                y = row * self.cell_height
-                frame = self.sprite_image.crop(
-                    (x, y, x + self.cell_width, y + self.cell_height)
-                )
-                frames.append(np.array(frame))
-        else:
-            # Similar logic to the GIF export
-            if self.selected_row >= 0:
-                row = self.selected_row
-                max_cols = self.sprite_image.size[0] // self.cell_width
-                
-                for col in range(max_cols):
-                    x = col * self.cell_width
-                    y = row * self.cell_height
-                    frame = self.sprite_image.crop(
-                        (x, y, x + self.cell_width, y + self.cell_height)
-                    )
-                    frames.append(np.array(frame))
-                
-            elif self.selected_column >= 0:
-                col = self.selected_column
-                max_rows = self.sprite_image.size[1] // self.cell_height
-                
-                for row in range(max_rows):
-                    x = col * self.cell_width
-                    y = row * self.cell_height
-                    frame = self.sprite_image.crop(
-                        (x, y, x + self.cell_width, y + self.cell_height)
-                    )
-                    frames.append(np.array(frame))
-                
-            else:
-                cells = sorted(self.selected_cells, key=lambda c: (c[1], c[0]))
-                
-                for col, row in cells:
-                    x = col * self.cell_width
-                    y = row * self.cell_height
-                    frame = self.sprite_image.crop(
-                        (x, y, x + self.cell_width, y + self.cell_height)
-                    )
-                    frames.append(np.array(frame))
-        
-        # Save frames as APNG
-        if frames:
-            imageio.mimsave(filename, frames, format='APNG', fps=10)
-            return True
-            
-        return False
+
+        frames, durations = self.get_selection_frames_and_durations(order)
+
+        # Saved via Pillow (not imageio) so APNG uses the SAME per-frame durations
+        # and loop_count as the GIF export. Legacy default: 100 ms/frame, loop forever.
+        frames[0].save(
+            filename,
+            format='PNG',
+            append_images=frames[1:],
+            save_all=True,
+            duration=durations,
+            loop=self.loop_count,
+            disposal=1  # restore to background -> preserves per-frame transparency
+        )
+        return True
 
     def set_zoom(self, zoom_index):
         if 0 <= zoom_index < len(self.zoom_levels):
@@ -1144,7 +1132,106 @@ class SpriteToolz(QMainWindow):
         
         # Add batch tab
         tab_widget.addTab(batch_tab, "Batch")
-        
+
+        # ---- Animation tab: per-frame timing, loop count, and live preview ----
+        anim_tab = QWidget()
+        anim_layout = QVBoxLayout()
+        anim_tab.setLayout(anim_layout)
+
+        # Preview area
+        preview_group = QGroupBox("Preview")
+        preview_layout = QVBoxLayout()
+
+        self.preview_label = QLabel("No preview")
+        self.preview_label.setFixedSize(240, 240)
+        self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview_label.setStyleSheet("background-color: #2b2b2b; color: #aaaaaa;")
+        preview_layout.addWidget(self.preview_label, alignment=Qt.AlignmentFlag.AlignHCenter)
+
+        self.preview_status_label = QLabel("Frame 0 / 0")
+        self.preview_status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        preview_layout.addWidget(self.preview_status_label)
+
+        preview_btn_layout = QHBoxLayout()
+        self.preview_play_btn = QPushButton("Play")
+        self.preview_play_btn.clicked.connect(self.play_preview)
+        self.preview_play_btn.setEnabled(False)
+        self.preview_stop_btn = QPushButton("Stop")
+        self.preview_stop_btn.clicked.connect(self.stop_preview)
+        self.preview_stop_btn.setEnabled(False)
+        preview_btn_layout.addWidget(self.preview_play_btn)
+        preview_btn_layout.addWidget(self.preview_stop_btn)
+        preview_layout.addLayout(preview_btn_layout)
+
+        preview_group.setLayout(preview_layout)
+        anim_layout.addWidget(preview_group)
+
+        # Timing controls (batch duration + loop count)
+        timing_group = QGroupBox("Timing")
+        timing_layout = QGridLayout()
+
+        timing_layout.addWidget(QLabel("Frame Duration (ms):"), 0, 0)
+        self.frame_duration_spin = QSpinBox()
+        self.frame_duration_spin.setRange(10, 10000)
+        self.frame_duration_spin.setValue(DEFAULT_FRAME_DURATION)
+        timing_layout.addWidget(self.frame_duration_spin, 0, 1)
+
+        self.apply_duration_btn = QPushButton("Apply to Selected Frames")
+        self.apply_duration_btn.clicked.connect(self.apply_duration_to_selection)
+        self.apply_duration_btn.setEnabled(False)
+        timing_layout.addWidget(self.apply_duration_btn, 1, 0, 1, 2)
+
+        timing_layout.addWidget(QLabel("Loop Count (0 = infinite):"), 2, 0)
+        self.loop_count_spin = QSpinBox()
+        self.loop_count_spin.setRange(0, 9999)
+        self.loop_count_spin.setValue(0)
+        self.loop_count_spin.valueChanged.connect(self.update_loop_count)
+        timing_layout.addWidget(self.loop_count_spin, 2, 1)
+
+        self.load_frames_btn = QPushButton("Load Selected Frames")
+        self.load_frames_btn.clicked.connect(self.refresh_timing_panel)
+        self.load_frames_btn.setEnabled(False)
+        timing_layout.addWidget(self.load_frames_btn, 3, 0, 1, 2)
+
+        self.reset_durations_btn = QPushButton("Reset All Durations")
+        self.reset_durations_btn.clicked.connect(self.reset_frame_durations)
+        self.reset_durations_btn.setEnabled(False)
+        timing_layout.addWidget(self.reset_durations_btn, 4, 0, 1, 2)
+
+        timing_group.setLayout(timing_layout)
+        anim_layout.addWidget(timing_group)
+
+        # Per-frame duration list (one editable spinbox per selected frame)
+        per_frame_group = QGroupBox("Per-Frame Durations")
+        per_frame_layout = QVBoxLayout()
+
+        self.frame_list_scroll = QScrollArea()
+        self.frame_list_scroll.setWidgetResizable(True)
+        self.frame_list_scroll.setMinimumHeight(160)
+        self.frame_list_container = QWidget()
+        self.frame_list_layout = QVBoxLayout()
+        self.frame_list_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.frame_list_container.setLayout(self.frame_list_layout)
+        self.frame_list_scroll.setWidget(self.frame_list_container)
+        per_frame_layout.addWidget(self.frame_list_scroll)
+
+        per_frame_group.setLayout(per_frame_layout)
+        anim_layout.addWidget(per_frame_group)
+
+        anim_layout.addStretch()
+
+        tab_widget.addTab(anim_tab, "Animation")
+
+        # Preview playback timer: single-shot and rescheduled per frame so each
+        # frame can be shown for its own duration (variable-interval playback).
+        self.preview_timer = QTimer(self)
+        self.preview_timer.setSingleShot(True)
+        self.preview_timer.timeout.connect(self._advance_preview)
+        self._preview_pixmaps = []
+        self._preview_durations = []
+        self._preview_index = 0
+        self._preview_loops_done = 0
+
         # Add widgets to main layout
         main_layout.addWidget(self.scroll_area)
         main_layout.addWidget(tab_widget)
@@ -1171,6 +1258,12 @@ class SpriteToolz(QMainWindow):
             self.zoom_in_button.setEnabled(True)
             self.zoom_out_button.setEnabled(True)
             self.zoom_reset_button.setEnabled(True)
+            # Enable animation timing controls
+            self.preview_play_btn.setEnabled(True)
+            self.apply_duration_btn.setEnabled(True)
+            self.load_frames_btn.setEnabled(True)
+            self.reset_durations_btn.setEnabled(True)
+            self.refresh_timing_panel()
             self.statusBar().showMessage(f"Loaded: {filename}")
     
     def export_selection(self):
@@ -1257,6 +1350,127 @@ class SpriteToolz(QMainWindow):
         except Exception as e:
             self.statusBar().showMessage(f"Error exporting frames: {str(e)}")
             return False
+
+    # ------------------------------------------------------------------
+    # Animation timing + variable-speed preview
+    # ------------------------------------------------------------------
+    def update_loop_count(self, value):
+        """Store the loop count on the canvas (0 = infinite). Shared by preview and export."""
+        self.sprite_canvas.loop_count = value
+
+    def apply_duration_to_selection(self):
+        """Batch: set every currently selected frame to the chosen duration."""
+        order = self.sprite_canvas.get_ordered_selection()
+        if not order:
+            self.statusBar().showMessage("No frames selected to apply duration to")
+            return
+        value = self.frame_duration_spin.value()
+        for pos in order:
+            self.sprite_canvas.frame_durations[pos] = value
+        self.refresh_timing_panel()
+        self.statusBar().showMessage(f"Set {len(order)} frame(s) to {value} ms")
+
+    def reset_frame_durations(self):
+        """Clear all custom per-frame durations (revert to the default fixed rate)."""
+        self.sprite_canvas.frame_durations.clear()
+        self.refresh_timing_panel()
+        self.statusBar().showMessage(f"Reset all frame durations to {DEFAULT_FRAME_DURATION} ms")
+
+    def _on_frame_duration_changed(self, pos, value):
+        """Update a single frame's duration when its per-frame spinbox changes."""
+        self.sprite_canvas.frame_durations[pos] = value
+
+    def refresh_timing_panel(self):
+        """Rebuild the per-frame duration list from the current selection order.
+
+        Called on selection changes (drag release / custom-click) and on demand.
+        A running preview is stopped so it never shows frames from a stale selection.
+        """
+        self.stop_preview()
+
+        # Clear existing rows
+        while self.frame_list_layout.count():
+            item = self.frame_list_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+
+        order = self.sprite_canvas.get_ordered_selection()
+        if not order:
+            self.frame_list_layout.addWidget(QLabel("No frames selected"))
+            self.preview_status_label.setText("Frame 0 / 0")
+            return
+
+        for i, (col, row) in enumerate(order):
+            row_widget = QWidget()
+            row_layout = QHBoxLayout()
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.addWidget(QLabel(f"{i + 1}: ({col}, {row})"))
+            spin = QSpinBox()
+            spin.setRange(10, 10000)
+            spin.setValue(self.sprite_canvas.frame_durations.get((col, row), DEFAULT_FRAME_DURATION))
+            spin.valueChanged.connect(functools.partial(self._on_frame_duration_changed, (col, row)))
+            row_layout.addWidget(spin)
+            row_widget.setLayout(row_layout)
+            self.frame_list_layout.addWidget(row_widget)
+
+        self.preview_status_label.setText(f"Frame 0 / {len(order)}")
+
+    def play_preview(self):
+        """Start variable-speed preview playback of the current selection."""
+        order = self.sprite_canvas.get_ordered_selection()
+        if not order:
+            self.statusBar().showMessage("Select frames to preview")
+            return
+
+        # Precompute scaled pixmaps (nearest-neighbour keeps pixel art crisp).
+        box = self.preview_label.size()
+        self._preview_pixmaps = []
+        for (col, row) in order:
+            pix = self.sprite_canvas._pil_to_pixmap(self.sprite_canvas.crop_frame(col, row))
+            pix = pix.scaled(box, Qt.AspectRatioMode.KeepAspectRatio,
+                             Qt.TransformationMode.FastTransformation)
+            self._preview_pixmaps.append(pix)
+        self._preview_durations = [
+            self.sprite_canvas.frame_durations.get(pos, DEFAULT_FRAME_DURATION) for pos in order
+        ]
+        self._preview_index = 0
+        self._preview_loops_done = 0
+
+        self.preview_play_btn.setEnabled(False)
+        self.preview_stop_btn.setEnabled(True)
+        self._show_preview_frame()
+        self.preview_timer.start(self._preview_durations[0])
+
+    def _show_preview_frame(self):
+        """Display the current preview frame and update the status label."""
+        i = self._preview_index
+        self.preview_label.setPixmap(self._preview_pixmaps[i])
+        self.preview_status_label.setText(
+            f"Frame {i + 1} / {len(self._preview_pixmaps)}  ({self._preview_durations[i]} ms)"
+        )
+
+    def _advance_preview(self):
+        """Timer callback: advance to the next frame, honoring the loop count."""
+        if not self._preview_pixmaps:
+            return
+        self._preview_index += 1
+        if self._preview_index >= len(self._preview_pixmaps):
+            self._preview_index = 0
+            self._preview_loops_done += 1
+            loop_count = self.sprite_canvas.loop_count
+            if loop_count != 0 and self._preview_loops_done >= loop_count:
+                self.stop_preview()
+                return
+        self._show_preview_frame()
+        self.preview_timer.start(self._preview_durations[self._preview_index])
+
+    def stop_preview(self):
+        """Stop preview playback and reset the play/stop buttons."""
+        self.preview_timer.stop()
+        has_image = self.sprite_canvas.sprite_image is not None
+        self.preview_play_btn.setEnabled(has_image)
+        self.preview_stop_btn.setEnabled(False)
 
     def toggle_cell_size_mode(self, state):
         """Toggle between manual cell size and row/column count mode"""
