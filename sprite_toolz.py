@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import sys
 import os
+import json
 import numpy as np
 from PIL import Image
 import imageio
@@ -536,7 +537,7 @@ class SpriteCanvas(QLabel):
         self.update_pixmap()
         return True
         
-    def export_selection_as_gif(self, filename):
+    def export_selection_as_gif(self, filename, duration=100, loop=0):
         if not self.selected_cells or self.sprite_image is None:
             return False
             
@@ -594,14 +595,14 @@ class SpriteCanvas(QLabel):
                 format='GIF',
                 append_images=frames[1:],
                 save_all=True,
-                duration=100,  # 100ms per frame
-                loop=0  # Loop forever
+                duration=duration,
+                loop=loop
             )
             return True
             
         return False
         
-    def export_selection_as_apng(self, filename):
+    def export_selection_as_apng(self, filename, fps=10):
         if not self.selected_cells or self.sprite_image is None:
             return False
             
@@ -657,7 +658,7 @@ class SpriteCanvas(QLabel):
         
         # Save frames as APNG
         if frames:
-            imageio.mimsave(filename, frames, format='APNG', fps=10)
+            imageio.mimsave(filename, frames, format='APNG', fps=fps)
             return True
             
         return False
@@ -850,8 +851,50 @@ class SpriteToolz(QMainWindow):
         export_layout.addWidget(self.export_button)
         
         export_group.setLayout(export_layout)
-        
+
         file_layout.addWidget(export_group)
+
+        # Animation Parameters group
+        anim_params_group = QGroupBox("Animation Parameters")
+        anim_params_layout = QGridLayout()
+
+        anim_params_layout.addWidget(QLabel("FPS (APNG):"), 0, 0)
+        self.anim_fps_spin = QSpinBox()
+        self.anim_fps_spin.setRange(1, 120)
+        self.anim_fps_spin.setValue(10)
+        anim_params_layout.addWidget(self.anim_fps_spin, 0, 1)
+
+        anim_params_layout.addWidget(QLabel("Duration (ms, GIF):"), 1, 0)
+        self.anim_duration_spin = QSpinBox()
+        self.anim_duration_spin.setRange(10, 5000)
+        self.anim_duration_spin.setValue(100)
+        self.anim_duration_spin.setSingleStep(10)
+        anim_params_layout.addWidget(self.anim_duration_spin, 1, 1)
+
+        anim_params_layout.addWidget(QLabel("Loop (0=infinite):"), 2, 0)
+        self.anim_loop_spin = QSpinBox()
+        self.anim_loop_spin.setRange(0, 999)
+        self.anim_loop_spin.setValue(0)
+        anim_params_layout.addWidget(self.anim_loop_spin, 2, 1)
+
+        anim_params_group.setLayout(anim_params_layout)
+        file_layout.addWidget(anim_params_group)
+
+        # Project Preset group
+        project_group = QGroupBox("Project")
+        project_layout = QVBoxLayout()
+
+        self.save_project_btn = QPushButton("Save Project")
+        self.save_project_btn.clicked.connect(self.save_project)
+        project_layout.addWidget(self.save_project_btn)
+
+        self.load_project_btn = QPushButton("Load Project")
+        self.load_project_btn.clicked.connect(self.load_project)
+        project_layout.addWidget(self.load_project_btn)
+
+        project_group.setLayout(project_layout)
+        file_layout.addWidget(project_group)
+
         file_group.setLayout(file_layout)
         basic_layout.addWidget(file_group)
         
@@ -1163,9 +1206,10 @@ class SpriteToolz(QMainWindow):
         filename, _ = QFileDialog.getOpenFileName(
             self, "Open Sprite Sheet", "", "Image Files (*.png *.jpg *.bmp *.gif)"
         )
-        
+
         if filename:
             self.sprite_canvas.load_spritesheet(filename)
+            self._current_image_path = filename
             self.export_button.setEnabled(True)
             # Enable zoom buttons
             self.zoom_in_button.setEnabled(True)
@@ -1212,9 +1256,16 @@ class SpriteToolz(QMainWindow):
             if filename:
                 success = False
                 if filter_used == "GIF (*.gif)":
-                    success = self.sprite_canvas.export_selection_as_gif(filename)
+                    success = self.sprite_canvas.export_selection_as_gif(
+                        filename,
+                        duration=self.anim_duration_spin.value(),
+                        loop=self.anim_loop_spin.value()
+                    )
                 else:  # PNG (APNG)
-                    success = self.sprite_canvas.export_selection_as_apng(filename)
+                    success = self.sprite_canvas.export_selection_as_apng(
+                        filename,
+                        fps=self.anim_fps_spin.value()
+                    )
                     
                 if success:
                     self.statusBar().showMessage(f"Exported animation to: {filename}")
@@ -1757,6 +1808,9 @@ class SpriteToolz(QMainWindow):
         export_gif = self.export_gif_cb.isChecked()
         export_apng = self.export_apng_cb.isChecked()
         include_subfolders = self.include_subfolders_cb.isChecked()
+        anim_fps = self.anim_fps_spin.value()
+        anim_duration = self.anim_duration_spin.value()
+        anim_loop = self.anim_loop_spin.value()
         
         # Create output folder
         output_folder = os.path.join(input_folder, "processed")
@@ -1878,8 +1932,8 @@ class SpriteToolz(QMainWindow):
                                         format='GIF',
                                         append_images=frames[1:],
                                         save_all=True,
-                                        duration=100,
-                                        loop=0,
+                                        duration=anim_duration,
+                                        loop=anim_loop,
                                         transparency=0,
                                         disposal=2  # Clear previous frame
                                     )
@@ -1907,9 +1961,9 @@ class SpriteToolz(QMainWindow):
                                         apng_path,
                                         frames,
                                         format='APNG',
-                                        fps=10,  # 10 frames per second
-                                        loop=0,  # Loop forever
-                                        duration=100  # 100ms per frame
+                                        fps=anim_fps,
+                                        loop=anim_loop,
+                                        duration=anim_duration
                                     )
                                     self.statusBar().showMessage(f"Created animated PNG for row {row}")
                                 except Exception as e:
@@ -1924,6 +1978,188 @@ class SpriteToolz(QMainWindow):
         
         self.batch_progress_label.setText("Processing complete")
         self.statusBar().showMessage("Batch processing complete")
+
+    # ── Project Preset Methods ──────────────────────────────────────
+
+    def _validate_int(self, value, lo, hi, default):
+        """Return *value* clamped to [lo, hi]; *default* if not an int."""
+        if not isinstance(value, int) or isinstance(value, bool):
+            return default
+        return max(lo, min(hi, value))
+
+    def save_project(self):
+        """Save current session settings as a JSON project file."""
+        # Determine export format
+        if self.strip_radio.isChecked():
+            export_format = "strip"
+        elif self.frames_radio.isChecked():
+            export_format = "frames"
+        else:
+            export_format = "animation"
+
+        # Determine source image path
+        source_image = ""
+        if self.sprite_canvas.sprite_image is not None:
+            source_image = getattr(self, '_current_image_path', '')
+
+        # Custom frame selection
+        custom_sel = None
+        if self.sprite_canvas.custom_frame_selection:
+            custom_sel = [list(f) for f in self.sprite_canvas.custom_frame_selection]
+
+        # Grid color as list
+        gc = self.sprite_canvas.grid_color
+        grid_color = [gc.red(), gc.green(), gc.blue(), gc.alpha()]
+
+        data = {
+            "version": 1,
+            "source_image": source_image,
+            "cell_size_mode": self.cell_size_mode_cb.isChecked(),
+            "cell_width": self.cell_width_spin.value(),
+            "cell_height": self.cell_height_spin.value(),
+            "row_count": self.row_count_spin.value(),
+            "col_count": self.col_count_spin.value(),
+            "padding": self.padding_spin.value(),
+            "show_grid": self.show_grid_checkbox.isChecked(),
+            "grid_color": grid_color,
+            "export_format": export_format,
+            "anim_fps": self.anim_fps_spin.value(),
+            "anim_duration": self.anim_duration_spin.value(),
+            "anim_loop": self.anim_loop_spin.value(),
+            "custom_frame_selection": custom_sel,
+        }
+
+        filename, _ = QFileDialog.getSaveFileName(
+            self, "Save Project", "", "Sprite Toolz Project (*.stproj)"
+        )
+        if not filename:
+            return
+        try:
+            with open(filename, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            self.statusBar().showMessage(f"Project saved to: {filename}")
+        except Exception as e:
+            QMessageBox.warning(self, "Save Error", f"Failed to save project:\n{e}")
+
+    def load_project(self):
+        """Load session settings from a JSON project file."""
+        filename, _ = QFileDialog.getOpenFileName(
+            self, "Load Project", "", "Sprite Toolz Project (*.stproj);;JSON (*.json)"
+        )
+        if not filename:
+            return
+        try:
+            with open(filename, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception as e:
+            QMessageBox.warning(self, "Load Error", f"Failed to load project:\n{e}")
+            return
+
+        if not isinstance(data, dict):
+            QMessageBox.warning(self, "Load Error", "Invalid project file format.")
+            return
+
+        # ── 1. Load source image (with relocation support) ──────────
+        source_image = data.get("source_image", "")
+        image_loaded = False
+        if source_image and os.path.isfile(source_image):
+            self.sprite_canvas.load_spritesheet(source_image)
+            self._current_image_path = source_image
+            image_loaded = True
+        elif source_image:
+            # Path invalid – ask user to relocate
+            reply = QMessageBox.question(
+                self, "Image Not Found",
+                f"The source image was not found:\n{source_image}\n\n"
+                "Would you like to locate it manually?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                new_path, _ = QFileDialog.getOpenFileName(
+                    self, "Locate Sprite Sheet", "",
+                    "Image Files (*.png *.jpg *.bmp *.gif)"
+                )
+                if new_path:
+                    self.sprite_canvas.load_spritesheet(new_path)
+                    self._current_image_path = new_path
+                    image_loaded = True
+
+        if image_loaded:
+            self.export_button.setEnabled(True)
+            self.zoom_in_button.setEnabled(True)
+            self.zoom_out_button.setEnabled(True)
+            self.zoom_reset_button.setEnabled(True)
+
+        # ── 2. Restore cell size mode ───────────────────────────────
+        cell_size_mode = data.get("cell_size_mode", False)
+        if not isinstance(cell_size_mode, bool):
+            cell_size_mode = False
+        self.cell_size_mode_cb.setChecked(cell_size_mode)
+        # toggle_cell_size_mode already handles UI visibility
+
+        # ── 3. Restore cell size / counts ───────────────────────────
+        cell_width  = self._validate_int(data.get("cell_width",  32), 1, 1000, 32)
+        cell_height = self._validate_int(data.get("cell_height", 32), 1, 1000, 32)
+        row_count   = self._validate_int(data.get("row_count",   1),  1, 1000, 1)
+        col_count   = self._validate_int(data.get("col_count",   1),  1, 1000, 1)
+
+        if cell_size_mode:
+            self.row_count_spin.setValue(row_count)
+            self.col_count_spin.setValue(col_count)
+            if image_loaded:
+                self.update_cell_size_from_count()
+        else:
+            self.cell_width_spin.setValue(cell_width)
+            self.cell_height_spin.setValue(cell_height)
+            if image_loaded:
+                self.update_cell_size()
+
+        # ── 4. Restore padding ──────────────────────────────────────
+        padding = self._validate_int(data.get("padding", 0), 0, 100, 0)
+        self.padding_spin.setValue(padding)
+        if image_loaded:
+            self.update_padding()
+
+        # ── 5. Restore grid settings ────────────────────────────────
+        show_grid = data.get("show_grid", True)
+        if not isinstance(show_grid, bool):
+            show_grid = True
+        self.show_grid_checkbox.setChecked(show_grid)
+        self.sprite_canvas.set_grid_visible(show_grid)
+
+        grid_color = data.get("grid_color", [255, 0, 0, 128])
+        if (isinstance(grid_color, list) and len(grid_color) == 4
+                and all(isinstance(c, int) and 0 <= c <= 255 for c in grid_color)):
+            self.sprite_canvas.set_grid_color(QColor(*grid_color))
+
+        # ── 6. Restore export format ────────────────────────────────
+        export_format = data.get("export_format", "strip")
+        if export_format == "frames":
+            self.frames_radio.setChecked(True)
+        elif export_format == "animation":
+            self.animation_radio.setChecked(True)
+        else:
+            self.strip_radio.setChecked(True)
+
+        # ── 7. Restore animation parameters ─────────────────────────
+        self.anim_fps_spin.setValue(
+            self._validate_int(data.get("anim_fps", 10), 1, 120, 10))
+        self.anim_duration_spin.setValue(
+            self._validate_int(data.get("anim_duration", 100), 10, 5000, 100))
+        self.anim_loop_spin.setValue(
+            self._validate_int(data.get("anim_loop", 0), 0, 999, 0))
+
+        # ── 8. Restore custom frame selection ───────────────────────
+        custom_sel = data.get("custom_frame_selection", None)
+        if (image_loaded and isinstance(custom_sel, list)
+                and all(isinstance(f, list) and len(f) == 2 for f in custom_sel)):
+            self.sprite_canvas.custom_frame_selection = [tuple(f) for f in custom_sel]
+            self.sprite_canvas.selected_cells = self.sprite_canvas.custom_frame_selection.copy()
+            self.sprite_canvas.is_custom_selecting = True
+            self.sprite_canvas.update()
+
+        self.statusBar().showMessage(f"Project loaded from: {filename}")
 
 
 def main():

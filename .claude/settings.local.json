@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m py_compile sprite_toolz.py)",
+      "Bash(python -c \"import json, sys, os, numpy; print\\(''Core imports OK''\\)\")",
+      "Bash(python -c \"import sprite_toolz; print\\(''Module imported successfully''\\)\")",
+      "Bash(python -c \"import sprite_toolz; print\\(''Final verification: OK''\\)\")"
+    ]
+  }
+}
